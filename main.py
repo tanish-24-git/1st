@@ -6,12 +6,16 @@ from pydantic import BaseModel, EmailStr
 from bcrypt import hashpw, gensalt, checkpw
 from models.demand_model import DemandForecastModel
 import pandas as pd
+import io
 from utils.data_preprocessing import preprocess_data
-import traceback
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -20,7 +24,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Dependency for DB session
 def get_db():
     db = SessionLocal()
     try:
@@ -28,7 +31,6 @@ def get_db():
     finally:
         db.close()
 
-# Pydantic Models
 class Login(BaseModel):
     email: EmailStr
     password: str
@@ -52,7 +54,6 @@ class ShopkeeperSignup(BaseModel):
     domain: str
     password: str
 
-# Login Endpoints
 @app.post("/dealer/login")
 async def dealer_login(login: Login, db: Session = Depends(get_db)):
     dealer = db.query(Dealer).filter(Dealer.email == login.email).first()
@@ -67,7 +68,6 @@ async def shopkeeper_login(login: Login, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return {"message": "Login successful", "shopkeeper_id": shopkeeper.shopkeeper_id}
 
-# Signup Endpoints
 @app.post("/dealer/signup")
 async def dealer_signup(signup: DealerSignup, db: Session = Depends(get_db)):
     if db.query(Dealer).filter(Dealer.email == signup.email).first():
@@ -90,21 +90,46 @@ async def shopkeeper_signup(signup: ShopkeeperSignup, db: Session = Depends(get_
     db.refresh(new_shopkeeper)
     return {"message": "Shopkeeper signup successful", "shopkeeper_id": new_shopkeeper.shopkeeper_id}
 
-# Inventory Prediction Endpoint
 @app.post("/inventory/predict")
 async def predict_inventory(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
+        if not file.filename.endswith('.csv'):
+            raise ValueError("File must be a CSV")
         contents = await file.read()
-        df = pd.read_csv(pd.compat.StringIO(contents.decode('utf-8')))
+        if not contents:
+            raise ValueError("File is empty")
+        
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        if df.empty:
+            raise ValueError("CSV file contains no data")
+        
+        logger.info(f"CSV loaded with {len(df)} rows and columns: {list(df.columns)}")
         X, y, scaler = preprocess_data(df)
         model = DemandForecastModel()
-        model.train(X, y)  # Train the model with uploaded data
+        model.train(X, y)
         predictions = model.predict(X)
-        # Return a single averaged prediction for simplicity
-        avg_prediction = predictions.mean() if predictions.size > 0 else 0
-        print(f"Generated prediction: {avg_prediction}")
-        return {"predictions": [avg_prediction]}  # Single value for the shop
+        
+        # Prepare detailed prediction results
+        product_ids = df['Product_ID'].tolist()
+        prediction_results = [
+            {
+                "product_id": str(pid),
+                "product_name": f"Product {pid}",
+                "predicted_demand": float(pred)
+            }
+            for pid, pred in zip(product_ids, predictions)
+        ]
+        
+        # Sort by predicted_demand and take top 5
+        top_5_predictions = sorted(prediction_results, key=lambda x: x["predicted_demand"], reverse=True)[:5]
+        
+        logger.info(f"Top 5 predictions: {top_5_predictions}")
+        
+        return {
+            "success": True,
+            "predictions": top_5_predictions,
+            "message": "Top 5 predictions generated"
+        }
     except Exception as e:
-        print(f"Error processing file: {str(e)}")
-        traceback.print_exc()  # Print full stack trace for debugging
-        raise HTTPException(status_code=400, detail=f"Invalid CSV format: {str(e)}")
+        logger.error(f"Prediction error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
